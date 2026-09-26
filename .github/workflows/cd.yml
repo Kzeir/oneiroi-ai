@@ -1,0 +1,54 @@
+name: CD - Deploy Oneiroi AI to Locaweb VPS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build and Deploy Oneiroi AI WebChat
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci || npm install
+
+      - name: Build Production Bundle
+        run: npm run build
+
+      - name: Setup SSH Connection Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.LOCAWEB_SSH_KEY }}
+
+      - name: Sync Build Artifacts to VPS
+        run: |
+          SSH_PORT=${{ secrets.LOCAWEB_SSH_PORT || '22' }}
+          DEPLOY_PATH="/root/oneiroi-ai"
+          ssh -p $SSH_PORT -o StrictHostKeyChecking=no ${{ secrets.LOCAWEB_SSH_USER }}@${{ secrets.LOCAWEB_SSH_HOST }} "mkdir -p $DEPLOY_PATH"
+          rsync -avz -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='node_modules/' \
+            --exclude='src/' \
+            ./ ${{ secrets.LOCAWEB_SSH_USER }}@${{ secrets.LOCAWEB_SSH_HOST }}:$DEPLOY_PATH/
+
+      - name: Start AI Container on VPS
+        run: |
+          SSH_PORT=${{ secrets.LOCAWEB_SSH_PORT || '22' }}
+          DEPLOY_PATH="/root/oneiroi-ai"
+          ssh -p $SSH_PORT -o StrictHostKeyChecking=no ${{ secrets.LOCAWEB_SSH_USER }}@${{ secrets.LOCAWEB_SSH_HOST }} << 'EOF'
+            cd /root/oneiroi-ai
+            docker compose pull || true
+            docker compose up -d --remove-orphans
+            docker ps --filter name=oneiroi-ai-web
+          EOF

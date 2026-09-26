@@ -1,0 +1,28 @@
+services:
+  oneiroi-ai-web:
+    image: nginx:alpine
+    container_name: oneiroi-ai-web
+    restart: always
+    volumes:
+      - ./dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - projeto_web_network
+    mem_limit: 64m
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: '0.25'
+        reservations:
+          memory: 16M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+networks:
+  projeto_web_network:
+    external: true
+    name: projeto_web_network
