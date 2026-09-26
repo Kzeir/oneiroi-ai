@@ -154,7 +154,7 @@ export function App() {
           activeAgent,
           collaborators,
           attachments,
-          localStorage.getItem('oneiroi_ai_custom_api_key') || undefined
+          selectedModel.id
         )
 
         setSessions((prev) =>

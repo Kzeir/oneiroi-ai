@@ -7,7 +7,47 @@ export interface GenerateImageParams {
   negativePrompt?: string
 }
 
-// 1. REAL LIVE AI IMAGE GENERATION (FLUX.1 / STABLE DIFFUSION NEURAL NETWORK)
+export interface HermesBoard {
+  slug: string
+  name: string
+  running: number
+  blocked: number
+  ready: number
+  done: number
+  total: number
+}
+
+export interface HermesTask {
+  id: string
+  title: string
+  assignee: string
+  status: string
+  priority: number
+  created_at: string
+}
+
+// Configuration accessors
+export function get9RouterConfig() {
+  const customUrl = localStorage.getItem('oneiroi_9router_url')?.trim()
+  const customToken = localStorage.getItem('oneiroi_9router_token')?.trim()
+
+  return {
+    url: customUrl || 'http://localhost:20128/v1',
+    token: customToken || 'sk-0f5c44b15d24c50c-bvpxjf-3fdde50e',
+  }
+}
+
+export function getHermesConfig() {
+  const customHubUrl = localStorage.getItem('oneiroi_hermes_hub_url')?.trim()
+  const customGatewayUrl = localStorage.getItem('oneiroi_hermes_gateway_url')?.trim()
+
+  return {
+    hubUrl: customHubUrl || 'http://localhost:9120/api',
+    gatewayUrl: customGatewayUrl || 'http://localhost:8642/api',
+  }
+}
+
+// 1. REAL LIVE AI IMAGE GENERATION (FLUX.1 / SDXL NEURAL NETWORK)
 export async function generateAIImage(params: GenerateImageParams): Promise<GeneratedImage> {
   const seed = Math.floor(Math.random() * 1000000)
   
@@ -29,16 +69,15 @@ export async function generateAIImage(params: GenerateImageParams): Promise<Gene
   const enrichedPrompt = `${params.prompt}, style: ${params.style}, high quality, 8k resolution, photorealistic, detailed lighting, sharp focus`
   const encodedPrompt = encodeURIComponent(enrichedPrompt)
 
-  // Real live AI image generation endpoint (Flux / SDXL Engine)
+  // Real live AI image generation endpoint (Flux Engine)
   const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=${width}&height=${height}&seed=${seed}&model=flux&nologo=true`
 
-  // Pre-load image in background to verify generation completion
-  await new Promise<void>((resolve, reject) => {
+  // Pre-load image in background
+  await new Promise<void>((resolve) => {
     const img = new Image()
     img.onload = () => resolve()
-    img.onerror = () => resolve() // fallback to direct URL if cors blocked
+    img.onerror = () => resolve()
     img.src = imageUrl
-    // Max 15s timeout
     setTimeout(() => resolve(), 15000)
   })
 
@@ -52,22 +91,143 @@ export async function generateAIImage(params: GenerateImageParams): Promise<Gene
   }
 }
 
-// 2. REAL LIVE LLM CALL WITH SYSTEM INSTRUCTION & MULTIMODAL VISION
+// 2. HERMES KANBAN HUB INTEGRATION
+export async function fetchHermesBoards(): Promise<HermesBoard[]> {
+  const { hubUrl } = getHermesConfig()
+  try {
+    const res = await fetch(`${hubUrl}/boards`, { method: 'GET' })
+    if (res.ok) {
+      const data = await res.json()
+      return data.boards || []
+    }
+  } catch (err) {
+    console.warn('Hermes Hub fetch boards failed:', err)
+  }
+  return []
+}
+
+export async function fetchHermesBoardTasks(slug: string): Promise<HermesTask[]> {
+  const { hubUrl } = getHermesConfig()
+  try {
+    const res = await fetch(`${hubUrl}/boards/${slug}/tasks`, { method: 'GET' })
+    if (res.ok) {
+      const data = await res.json()
+      return data.tasks || []
+    }
+  } catch (err) {
+    console.warn(`Hermes Hub fetch tasks for board ${slug} failed:`, err)
+  }
+  return []
+}
+
+// Helper to call 9Router OpenAI-compatible endpoint
+async function call9Router(
+  systemPrompt: string,
+  userText: string,
+  attachments: ImageAttachment[] = [],
+  modelId: string = 'Paid-tier'
+): Promise<string | null> {
+  const { url, token } = get9RouterConfig()
+  const temperature = parseFloat(localStorage.getItem('oneiroi_temp') || '0.7')
+
+  // Possible endpoints to try (direct localhost, netbird ip, or custom)
+  const candidateUrls = [
+    url,
+    'http://localhost:20128/v1',
+    'http://127.0.0.1:20128/v1',
+    'http://100.99.88.69:20128/v1',
+    'https://9route.oneiroigroup.com/v1',
+  ]
+  const uniqueUrls = Array.from(new Set(candidateUrls))
+
+  for (const baseUrl of uniqueUrls) {
+    try {
+      // Build message payload
+      const userContent: any[] = [{ type: 'text', text: userText || 'Analise e responda com profundidade técnica.' }]
+      for (const att of attachments) {
+        if (att.url.startsWith('data:') || att.url.startsWith('http')) {
+          userContent.push({
+            type: 'image_url',
+            image_url: { url: att.url },
+          })
+        }
+      }
+
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 25000)
+
+      const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          model: modelId,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent },
+          ],
+          temperature,
+        }),
+        signal: controller.signal,
+      })
+      clearTimeout(timeoutId)
+
+      if (response.ok) {
+        const textOutput = await response.text()
+        
+        // Handle Server-Sent Events (SSE) streaming format if returned
+        if (textOutput.includes('data:')) {
+          const lines = textOutput.split('\n')
+          let accumulated = ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
+              try {
+                const chunk = JSON.parse(trimmed.slice(6))
+                const delta = chunk.choices?.[0]?.delta?.content || chunk.choices?.[0]?.text || ''
+                accumulated += delta
+              } catch (_) {}
+            }
+          }
+          if (accumulated.trim().length > 0) return accumulated.trim()
+        }
+
+        // Handle standard JSON response
+        try {
+          const data = JSON.parse(textOutput)
+          const content = data.choices?.[0]?.message?.content
+          if (content) return content
+        } catch (_) {}
+      }
+    } catch (err) {
+      // Try next candidate endpoint
+      console.warn(`9Router candidate ${baseUrl} failed, trying next...`, err)
+    }
+  }
+
+  return null
+}
+
+// 3. REAL LIVE LLM CALL WITH SYSTEM INSTRUCTION & MULTIMODAL VISION
 async function callLiveAI(
   systemPrompt: string,
   userText: string,
   attachments: ImageAttachment[] = [],
-  modelId: string = 'gemini-1.5-flash'
+  modelId: string = 'Paid-tier'
 ): Promise<string> {
-  const geminiKey = localStorage.getItem('oneiroi_ai_custom_api_key')?.trim()
-  const openRouterKey = localStorage.getItem('oneiroi_openrouter_key')?.trim()
+  // 1. Primary Engine: 9Router Live Multi-Model Network
+  const routerResponse = await call9Router(systemPrompt, userText, attachments, modelId)
+  if (routerResponse) {
+    return routerResponse
+  }
 
-  // 1. If Google Gemini API Key is provided
+  // 2. Direct Google Gemini API Key (if provided by user in Settings)
+  const geminiKey = localStorage.getItem('oneiroi_ai_custom_api_key')?.trim()
   if (geminiKey) {
     try {
       const parts: any[] = [{ text: userText || 'Analise o anexo e forneça um parecer completo.' }]
-
-      // If there are image attachments, attach real base64 inline data
       for (const att of attachments) {
         if (att.url.startsWith('data:')) {
           const match = att.url.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/)
@@ -105,11 +265,12 @@ async function callLiveAI(
         if (candidate) return candidate
       }
     } catch (err) {
-      console.warn('Direct Gemini API call error, trying fallback:', err)
+      console.warn('Direct Gemini API call error:', err)
     }
   }
 
-  // 2. If OpenRouter API Key is provided
+  // 3. Direct OpenRouter API Key (if provided by user in Settings)
+  const openRouterKey = localStorage.getItem('oneiroi_openrouter_key')?.trim()
   if (openRouterKey) {
     try {
       let openRouterModel = 'anthropic/claude-3.5-sonnet'
@@ -149,56 +310,29 @@ async function callLiveAI(
         if (text) return text
       }
     } catch (err) {
-      console.warn('OpenRouter API call error, trying fallback:', err)
+      console.warn('OpenRouter API call error:', err)
     }
   }
 
-  // 3. High Performance Live Real AI Endpoint (Zero Setup Fallback)
-  try {
-    const payloadPrompt = `${systemPrompt}\n\n[INSTRUÇÃO DO USUÁRIO]:\n${userText || 'Por favor, realize uma análise detalhada deste contexto.'}`
-    
-    const response = await fetch('https://text.pollinations.ai/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userText || 'Realize uma análise detalhada deste contexto.' },
-        ],
-        model: 'openai',
-        jsonMode: false,
-      }),
-    })
+  // If all connections fail, return actionable diagnostic rather than a fake answer
+  const { url } = get9RouterConfig()
+  return `### ⚠️ Falha na Conexão com 9Router & Provedores
 
-    if (response.ok) {
-      const liveText = await response.text()
-      if (liveText && liveText.trim().length > 0) {
-        return liveText
-      }
-    }
-  } catch (err) {
-    console.error('Live AI network error:', err)
-  }
+Não foi possível estabelecer comunicação com o gateway **9Router** em \`${url}\` ou nos provedores configurados.
 
-  // 4. Robust Fail-Safe if completely offline
-  return `### Resposta Gerada por ${systemPrompt.split('\n')[0]}
-
-Com base na sua solicitação: "${userText}"
-
-1. **Diagnóstico & Estratégia:** A abordagem deve priorizar a arquitetura limpa, segurança dos endpoints e máxima performance.
-2. **Execução Técnica:**
-   - Isole os estados e assegure conformidade com as regras de negócio do Oneiroi Group.
-   - Configure chaves de API nas **Configurações** (Google Gemini ou OpenRouter) para utilizar cotas dedicadas de modelos proprietários.
-3. **Próximos Passos:** Valide a integração na infraestrutura e monitore a latência através do Grafana.`
+**Para ativar a IA ao vivo:**
+1. **9Router Local / VPN:** Verifique se o container docker do 9Router está ativo na porta \`20128\` ou se você está conectado via **NetBird VPN** (\`100.99.88.69\`).
+2. **Chave de API Dedicada:** Abra as **Configurações** (ícone de engrenagem) e insira sua chave do **Google Gemini** ou **OpenRouter**.
+3. **Hermes Gateway:** O status dos boards e agentes do Hermes pode ser inspecionado na porta \`9120\`.`
 }
 
-// 3. REAL MULTI-AGENT EXECUTION PIPELINE
+// 4. REAL MULTI-AGENT EXECUTION PIPELINE
 export async function processAgentResponse(
   userText: string,
   primaryAgent: Agent,
   collaborators: Agent[],
   attachments: ImageAttachment[] = [],
-  apiKey?: string
+  modelId: string = 'Paid-tier'
 ): Promise<Message[]> {
   const responses: Message[] = []
 
@@ -207,7 +341,7 @@ export async function processAgentResponse(
     primaryAgent.systemPrompt,
     userText,
     attachments,
-    'gemini-1.5-flash'
+    modelId
   )
 
   responses.push({
@@ -233,7 +367,7 @@ Sua tarefa: Forneça sua perspectiva especializada, análise crítica ou complem
       collabSystemPrompt,
       `Complemente a análise de ${primaryAgent.name} sobre: "${userText}"`,
       attachments,
-      'gemini-1.5-flash'
+      modelId
     )
 
     responses.push({
